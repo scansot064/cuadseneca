@@ -31,6 +31,10 @@ Para actualizar un userscript, reemplaza su contenido por la versión nueva y re
 - Los scripts requieren que Séneca conserve una estructura de página compatible. Cambios del sitio pueden requerir actualizar los selectores o el comportamiento.
 - No compartas capturas, archivos ni registros de consola que contengan nombres, identificadores o calificaciones de estudiantes.
 
+## Apoyar el proyecto
+
+Si estas herramientas te resultan útiles, puedes [invitarme a un café](https://www.buymeacoffee.com/scansot064). ¡Gracias por tu apoyo!
+
 ## Estructura
 
 ```text
