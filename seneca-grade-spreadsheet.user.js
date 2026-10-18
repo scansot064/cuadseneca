@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Seneca grade spreadsheet
 // @namespace    https://seneca.juntadeandalucia.es/
-// @version      1.2.0
+// @version      1.3.0
 // @description  Edit all criteria for all students using Seneca's existing save flow.
 // @match        https://seneca.juntadeandalucia.es/*
 // @run-at       document-idle
@@ -20,6 +20,8 @@
         originalStudentId: "",
         students: []
     };
+    let autosaveQueue = Promise.resolve();
+    let autosavesPending = 0;
 
     const style = document.createElement("style");
     style.textContent = `
@@ -117,6 +119,17 @@
             text-align: center;
         }
 
+        #${panelId} .senecaSpreadsheetGrade.senecaSpreadsheetInvalid {
+            border-color: #dc3545;
+            outline: 1px solid #dc3545;
+        }
+
+        #${panelId} .senecaSpreadsheetValidation {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
         #${panelId} .senecaSpreadsheetRowStatus {
             color: #555;
             white-space: nowrap;
@@ -138,8 +151,12 @@
             <button type="button" data-action="load">Cargar alumnado</button>
             <button type="button" data-action="save" disabled>Guardar cambios</button>
             <button type="button" data-action="copy" title="Copiar la nota de cada estudiante del primer criterio a sus demás criterios" disabled>Copiar 1.ª nota al resto</button>
+            <label class="senecaSpreadsheetValidation">
+                <input type="checkbox" data-role="allow-below-one">
+                Esta clase permite valores menores de 1
+            </label>
         </div>
-        <p>La carga recorre el alumnado y guarda las notas actuales sin cambios mediante Seneca.</p>
+        <p>La carga recorre el alumnado y guarda las notas actuales sin cambios mediante Seneca. Al salir de una casilla válida, sus cambios se guardan automáticamente.</p>
         <p class="senecaSpreadsheetStatus" data-role="status" aria-live="polite"></p>
         <div class="senecaSpreadsheetTableWrap" data-role="table"></div>
     `;
@@ -150,6 +167,7 @@
     const loadButton = panel.querySelector('[data-action="load"]');
     const saveButton = panel.querySelector('[data-action="save"]');
     const copyButton = panel.querySelector('[data-action="copy"]');
+    const allowBelowOneCheckbox = panel.querySelector('[data-role="allow-below-one"]');
 
     function formatSpanishScore(value) {
         if (value === "") {
@@ -188,16 +206,17 @@
 
     function setBusy(busy) {
         state.busy = busy;
-        loadButton.disabled = busy;
+        loadButton.disabled = busy || autosavesPending > 0;
         saveButton.disabled = busy || !state.loaded;
         copyButton.disabled = busy || !state.loaded || state.criteria.length < 2;
+        allowBelowOneCheckbox.disabled = busy;
         panel.querySelector('[data-action="close"]').disabled = busy;
         panel.querySelectorAll(".senecaSpreadsheetGrade").forEach((input) => {
             input.disabled = busy;
         });
     }
 
-    function parseGrade(text) {
+    function parseGrade(text, allowBelowOne = allowBelowOneCheckbox.checked) {
         const normalized = text.trim().replace(",", ".");
         if (normalized === "") {
             return { valid: true, value: "" };
@@ -208,9 +227,28 @@
 
         const value = Number(normalized);
         return {
-            valid: Number.isFinite(value) && value >= 0 && value <= 10,
+            valid: Number.isFinite(value)
+                && value <= 10
+                && value >= (allowBelowOne ? 0 : 1),
             value: String(value)
         };
+    }
+
+    function validationMessage() {
+        return allowBelowOneCheckbox.checked
+            ? "Introduce una nota entre 0 y 10; usa coma o punto decimal."
+            : "Introduce una nota entre 1 y 10; para admitir valores inferiores a 1, marca la casilla de la clase.";
+    }
+
+    function validateGradeInput(input, report = false) {
+        const parsed = parseGrade(input.value);
+        input.setCustomValidity(parsed.valid ? "" : validationMessage());
+        input.classList.toggle("senecaSpreadsheetInvalid", !parsed.valid);
+        input.setAttribute("aria-invalid", String(!parsed.valid));
+        if (!parsed.valid && report) {
+            input.reportValidity();
+        }
+        return parsed;
     }
 
     function renderTable() {
@@ -253,16 +291,20 @@
                 gradeInput.dataset.studentIndex = String(index);
                 gradeInput.dataset.criterionId = criterion.id;
                 gradeInput.addEventListener("input", () => {
-                    const parsed = parseGrade(gradeInput.value);
-                    gradeInput.setCustomValidity(parsed.valid ? "" : "Introduce una nota entre 0 y 10; usa coma o punto decimal.");
+                    const parsed = validateGradeInput(gradeInput);
                     student.editedGrades[criterion.id] = parsed.valid ? parsed.value : null;
+                    const hasInvalidGrade = Array.from(row.querySelectorAll(".senecaSpreadsheetGrade"))
+                        .some((input) => !validateGradeInput(input).valid);
                     const hasPendingChange = state.criteria.some((entry) =>
                         student.editedGrades[entry.id] !== null
                         && student.editedGrades[entry.id] !== undefined
                         && student.editedGrades[entry.id] !== student.grades[entry.id]
                     );
                     row.querySelector(".senecaSpreadsheetRowStatus").textContent =
-                        parsed.valid ? (hasPendingChange ? "Pendiente" : "") : "Nota no válida";
+                        hasInvalidGrade ? "Nota no válida" : (hasPendingChange ? "Pendiente" : "");
+                });
+                gradeInput.addEventListener("blur", () => {
+                    enqueueAutosave(student, row);
                 });
                 gradeCell.append(gradeInput);
                 row.append(gradeCell);
@@ -296,8 +338,7 @@
                 continue;
             }
 
-            const parsed = parseGrade(sourceInput.value);
-            sourceInput.setCustomValidity(parsed.valid ? "" : "Introduce una nota entre 0 y 10; usa coma o punto decimal.");
+            const parsed = validateGradeInput(sourceInput);
             if (!parsed.valid) {
                 sourceInput.focus();
                 status.textContent = "No se copiaron las notas: corrige primero la nota no válida de la primera columna.";
@@ -322,7 +363,14 @@
         });
 
         const copiedRows = new Set(copies.map(({ input }) => input.closest("tr")));
-        status.textContent = `Copiadas las notas de ${copiedRows.size} estudiantes a los demás criterios. Pulsa «Guardar cambios» para guardarlas.`;
+        copiedRows.forEach((row) => {
+            const studentIndex = Number(row?.querySelector(".senecaSpreadsheetGrade")?.dataset.studentIndex);
+            const student = state.students[studentIndex];
+            if (student && row) {
+                enqueueAutosave(student, row);
+            }
+        });
+        status.textContent = `Copiadas las notas de ${copiedRows.size} estudiantes a los demás criterios; guardando automáticamente.`;
     }
 
     function getHiddenValue(modal, id) {
@@ -499,7 +547,12 @@
                     const gradeInput = getGradeInput(studentModal, criterion.id);
                     const parsedGrade = parseGrade(gradeInput.value);
                     if (!parsedGrade.valid) {
-                        throw new Error(`La nota de ${criterion.shortLabel} para ${student.name} no es válida.`);
+                        throw new Error(
+                            `La nota de ${criterion.shortLabel} para ${student.name} queda fuera del rango permitido. `
+                            + (allowBelowOneCheckbox.checked
+                                ? "El rango actual es de 0 a 10."
+                                : "El rango actual es de 1 a 10; marca la casilla si esta clase permite notas inferiores a 1.")
+                        );
                     }
                     student.grades[criterion.id] = parsedGrade.value;
                 });
@@ -523,16 +576,92 @@
         }
     }
 
-    function setStudentGrades(student) {
+    function getPendingGrades(student) {
+        const pendingGrades = Object.create(null);
+        state.criteria.forEach((criterion) => {
+            const grade = student.editedGrades[criterion.id];
+            if (grade !== null && grade !== undefined && grade !== student.grades[criterion.id]) {
+                pendingGrades[criterion.id] = grade;
+            }
+        });
+        return pendingGrades;
+    }
+
+    function getStudentRow(student) {
+        const studentIndex = state.students.indexOf(student);
+        return studentIndex < 0
+            ? null
+            : panel.querySelectorAll("tbody tr")[studentIndex] || null;
+    }
+
+    function setStudentRowStatus(student, message) {
+        const row = getStudentRow(student);
+        const rowStatus = row?.querySelector(".senecaSpreadsheetRowStatus");
+        if (rowStatus) {
+            rowStatus.textContent = message;
+        }
+    }
+
+    function validateStudentRow(student, row, report = false) {
+        let firstInvalid = null;
+        row.querySelectorAll(".senecaSpreadsheetGrade").forEach((input) => {
+            const parsed = validateGradeInput(input);
+            student.editedGrades[input.dataset.criterionId] = parsed.valid
+                && parsed.value !== student.grades[input.dataset.criterionId]
+                ? parsed.value
+                : null;
+            if (!parsed.valid && !firstInvalid) {
+                firstInvalid = input;
+            }
+        });
+
+        if (firstInvalid && report) {
+            firstInvalid.focus();
+            firstInvalid.reportValidity();
+        }
+        return firstInvalid === null;
+    }
+
+    function validateAllGrades(report = false) {
+        const gradeInputs = Array.from(panel.querySelectorAll(".senecaSpreadsheetGrade"));
+        const invalidInputs = gradeInputs.filter((input) => !validateGradeInput(input).valid);
+        if (report && invalidInputs.length > 0) {
+            invalidInputs[0].focus();
+            invalidInputs[0].reportValidity();
+        }
+        return invalidInputs.length === 0;
+    }
+
+    function markSnapshotSaved(student, snapshot) {
+        state.criteria.forEach((criterion) => {
+            if (!Object.hasOwn(snapshot, criterion.id)) {
+                return;
+            }
+
+            const savedGrade = snapshot[criterion.id];
+            student.grades[criterion.id] = savedGrade;
+            const currentInput = getStudentRow(student)?.querySelector(
+                `.senecaSpreadsheetGrade[data-criterion-id="${CSS.escape(criterion.id)}"]`
+            );
+            const currentGrade = currentInput ? validateGradeInput(currentInput).value : undefined;
+            if (currentGrade === savedGrade) {
+                student.editedGrades[criterion.id] = null;
+            }
+        });
+
+        const pendingGrades = getPendingGrades(student);
+        setStudentRowStatus(student, Object.keys(pendingGrades).length > 0 ? "Pendiente" : "Guardada");
+    }
+
+    function applyStudentGrades(student, snapshot) {
         const modal = getModal();
         if (!modal || getCurrentStudentId(modal) !== student.id) {
             throw new Error(`No está abierto el estudiante ${student.name}.`);
         }
 
         state.criteria.forEach((criterion) => {
-            const editedGrade = student.editedGrades[criterion.id];
-            if (editedGrade === null || editedGrade === undefined
-                || editedGrade === student.grades[criterion.id]) {
+            const editedGrade = snapshot[criterion.id];
+            if (editedGrade === undefined) {
                 return;
             }
 
@@ -543,29 +672,89 @@
         });
     }
 
-    async function saveChanges() {
-        const gradeInputs = Array.from(panel.querySelectorAll(".senecaSpreadsheetGrade"));
-        for (const input of gradeInputs) {
-            if (!input.reportValidity()) {
-                input.focus();
-                return;
-            }
+    async function saveStudentSnapshot(student, snapshot) {
+        if (Object.keys(snapshot).length === 0) {
+            return;
         }
 
-        const changedStudents = state.students.filter((student) => state.criteria.some((criterion) =>
-            student.editedGrades[criterion.id] !== null
-            && student.editedGrades[criterion.id] !== undefined
-            && student.editedGrades[criterion.id] !== student.grades[criterion.id]
-        ));
-        if (changedStudents.length === 0) {
-            status.textContent = "No hay cambios para guardar.";
+        let modal = getModal();
+        if (!modal) {
+            throw new Error("La ventana de calificación de Séneca ya no está disponible.");
+        }
+        if (getCurrentStudentId(modal) !== student.id) {
+            modal = await loadStudent(student.id);
+        }
+
+        applyStudentGrades(student, snapshot);
+        await loadStudent(student.id);
+        markSnapshotSaved(student, snapshot);
+    }
+
+    function enqueueAutosave(student, row) {
+        if (state.busy || !state.loaded || !validateStudentRow(student, row)) {
+            if (state.loaded && !state.busy) {
+                setStudentRowStatus(student, "Autoguardado bloqueado: corrige las notas no válidas.");
+                status.textContent = `No se guardó a ${student.name}: corrige las notas marcadas en rojo.`;
+            }
+            return;
+        }
+
+        const snapshot = getPendingGrades(student);
+        if (Object.keys(snapshot).length === 0) {
+            return;
+        }
+
+        autosavesPending += 1;
+        setStudentRowStatus(student, "Autoguardado pendiente…");
+        autosaveQueue = autosaveQueue.then(async () => {
+            try {
+                if (Object.values(snapshot).some((grade) => !parseGrade(grade).valid)) {
+                    setStudentRowStatus(student, "No válida: revisa el límite de la clase.");
+                    status.textContent = `No se autoguardó a ${student.name}: la nota dejó de ser válida con el límite actual.`;
+                    return;
+                }
+
+                setStudentRowStatus(student, "Autoguardando…");
+                status.textContent = `Autoguardando cambios de ${student.name}…`;
+                await saveStudentSnapshot(student, snapshot);
+                status.textContent = `Cambios de ${student.name} guardados automáticamente.`;
+            } catch (error) {
+                setStudentRowStatus(student, "Error al autoguardar");
+                status.textContent = `No se pudieron autoguardar los cambios de ${student.name}: ${error.message} Pulsa «Guardar cambios» para reintentarlo.`;
+                console.error("[Seneca grade spreadsheet] Autosave failed", error);
+            } finally {
+                autosavesPending -= 1;
+                allowBelowOneCheckbox.disabled = state.busy;
+                loadButton.disabled = state.busy || autosavesPending > 0;
+            }
+        });
+    }
+
+    async function saveChanges() {
+        if (!validateAllGrades(true)) {
+            status.textContent = "No se guardó ningún cambio: corrige primero las notas marcadas en rojo.";
             return;
         }
 
         setBusy(true);
-        const originalGrades = state.students.map((student) => ({ ...student.grades }));
-
         try {
+            await autosaveQueue;
+
+            if (!validateAllGrades(true)) {
+                status.textContent = "No se guardó ningún cambio: corrige primero las notas marcadas en rojo.";
+                return;
+            }
+
+            const changedStudents = state.students.filter((student) => state.criteria.some((criterion) =>
+                student.editedGrades[criterion.id] !== null
+                && student.editedGrades[criterion.id] !== undefined
+                && student.editedGrades[criterion.id] !== student.grades[criterion.id]
+            ));
+            if (changedStudents.length === 0) {
+                status.textContent = "No hay cambios para guardar.";
+                return;
+            }
+
             for (let index = 0; index < changedStudents.length; index += 1) {
                 const student = changedStudents[index];
                 const modal = getModal();
@@ -575,7 +764,9 @@
                     await loadStudent(student.id);
                 }
 
-                setStudentGrades(student);
+                const snapshot = getPendingGrades(student);
+                applyStudentGrades(student, snapshot);
+                setStudentRowStatus(student, "Guardando…");
                 status.textContent = `Guardando ${index + 1} de ${changedStudents.length}: ${student.name}`;
 
                 const nextChangedStudentId = index + 1 < changedStudents.length
@@ -588,18 +779,7 @@
                     || student.id;
                 await loadStudent(saveTargetId);
 
-                state.criteria.forEach((criterion) => {
-                    const editedGrade = student.editedGrades[criterion.id];
-                    if (editedGrade !== null && editedGrade !== undefined) {
-                        student.grades[criterion.id] = editedGrade;
-                    }
-                });
-                student.status = "Guardada";
-                const rowIndex = state.students.findIndex((entry) => entry.id === student.id);
-                const row = panel.querySelectorAll("tbody tr")[rowIndex];
-                if (row) {
-                    row.querySelector(".senecaSpreadsheetRowStatus").textContent = "Guardada";
-                }
+                markSnapshotSaved(student, snapshot);
             }
 
             const currentModal = getModal();
@@ -610,17 +790,43 @@
 
             status.textContent = `Guardadas las notas de ${changedStudents.length} estudiantes.`;
         } catch (error) {
-            state.students.forEach((student, index) => {
-                if (student.status !== "Guardada") {
-                    student.grades = originalGrades[index];
-                }
-            });
             status.textContent = `Guardado detenido: ${error.message} Revisa las notas en Seneca antes de volver a intentarlo.`;
             throw error;
         } finally {
             setBusy(false);
         }
     }
+
+    allowBelowOneCheckbox.addEventListener("change", () => {
+        if (!state.loaded) {
+            status.textContent = allowBelowOneCheckbox.checked
+                ? "Se permiten notas desde 0 hasta 10 en esta clase."
+                : "Se permiten notas desde 1 hasta 10 en esta clase.";
+            return;
+        }
+
+        state.students.forEach((student) => {
+            const row = getStudentRow(student);
+            if (!row) {
+                return;
+            }
+
+            const isValid = validateStudentRow(student, row);
+            const pending = getPendingGrades(student);
+            setStudentRowStatus(
+                student,
+                !isValid
+                    ? "Nota no válida"
+                    : Object.keys(pending).length > 0 ? "Pendiente" : ""
+            );
+            if (isValid && Object.keys(pending).length > 0) {
+                enqueueAutosave(student, row);
+            }
+        });
+        status.textContent = allowBelowOneCheckbox.checked
+            ? "Validación actualizada: se permiten notas desde 0 hasta 10."
+            : "Validación actualizada: se permiten notas desde 1 hasta 10.";
+    });
 
     panel.addEventListener("click", (event) => {
         const button = event.target instanceof Element

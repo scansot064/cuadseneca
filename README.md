@@ -9,7 +9,7 @@ Colección de userscripts de Tampermonkey para mejorar algunos flujos de trabajo
 | Script | Función |
 | --- | --- |
 | [Navegación mejorada del Cuaderno](seneca-cuaderno-navigation.user.js) | Añade pestañas para cambiar de grupo y recuerda la evaluación seleccionada. Consulta la [documentación](docs/navegacion-cuaderno.md). |
-| [Planilla de calificaciones](seneca-grade-spreadsheet.user.js) | Presenta estudiantes en filas y criterios en columnas, permite editar notas y copiarlas desde el primer criterio; guarda mediante el flujo de Séneca estudiante por estudiante. Consulta la [documentación](docs/planilla-calificaciones.md). |
+| [Planilla de calificaciones](seneca-grade-spreadsheet.user.js) | Presenta estudiantes en filas y criterios en columnas, valida las notas, las autoguarda al salir de cada casilla y permite copiarlas desde el primer criterio. Consulta la [documentación](docs/planilla-calificaciones.md). |
 | [Escala de cuarto de punto](seneca-quarter-grade-scale.user.js) | Añade una escala interactiva de 1 a 10 en incrementos de 0,25; oculta visualmente las rúbricas y muestra sus descripciones en un cuadro emergente. Consulta la [documentación](docs/escala-cuarto-punto.md). |
 
 ## Instalación en Tampermonkey
