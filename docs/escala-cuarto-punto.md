@@ -19,7 +19,7 @@ La nota se asigna al campo de entrada de Séneca. La escala no guarda por sí so
 
 ## Compatibilidad con la planilla
 
-La escala y la planilla son userscripts independientes. La planilla utiliza su propia tabla y el flujo de guardado existente; no necesita la escala. Se pueden activar ambas, pero para editar una tanda de calificaciones en la planilla es recomendable usar las casillas de la tabla y guardar desde **Guardar cambios**.
+La escala y la planilla son userscripts independientes. La planilla utiliza su propia tabla y el flujo de guardado existente; no necesita la escala. Se pueden activar ambas, pero para editar una tanda de calificaciones en la planilla es recomendable usar las casillas de la tabla y esperar a que termine el autoguardado.
 
 ## Privacidad y compatibilidad
 

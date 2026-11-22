@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Seneca grade spreadsheet
 // @namespace    https://seneca.juntadeandalucia.es/
-// @version      1.3.0
+// @version      1.4.0
 // @description  Edit all criteria for all students using Seneca's existing save flow.
 // @match        https://seneca.juntadeandalucia.es/*
 // @run-at       document-idle
@@ -22,6 +22,7 @@
     };
     let autosaveQueue = Promise.resolve();
     let autosavesPending = 0;
+    let maximumScoreWasInvalid = false;
 
     const style = document.createElement("style");
     style.textContent = `
@@ -124,6 +125,15 @@
             outline: 1px solid #dc3545;
         }
 
+        #${panelId} .senecaSpreadsheetMaximum {
+            width: 5.5rem;
+        }
+
+        #${panelId} .senecaSpreadsheetMaximum:invalid {
+            border-color: #dc3545;
+            outline: 1px solid #dc3545;
+        }
+
         #${panelId} .senecaSpreadsheetValidation {
             display: inline-flex;
             align-items: center;
@@ -149,8 +159,11 @@
         </div>
         <div class="senecaSpreadsheetActions">
             <button type="button" data-action="load">Cargar alumnado</button>
-            <button type="button" data-action="save" disabled>Guardar cambios</button>
             <button type="button" data-action="copy" title="Copiar la nota de cada estudiante del primer criterio a sus demás criterios" disabled>Copiar 1.ª nota al resto</button>
+            <label class="senecaSpreadsheetValidation">
+                Puntuación máxima
+                <input class="senecaSpreadsheetMaximum" type="text" inputmode="decimal" data-role="maximum-score" placeholder="10">
+            </label>
             <label class="senecaSpreadsheetValidation">
                 <input type="checkbox" data-role="allow-below-one">
                 Esta clase permite valores menores de 1
@@ -165,8 +178,8 @@
     const status = panel.querySelector('[data-role="status"]');
     const tableContainer = panel.querySelector('[data-role="table"]');
     const loadButton = panel.querySelector('[data-action="load"]');
-    const saveButton = panel.querySelector('[data-action="save"]');
     const copyButton = panel.querySelector('[data-action="copy"]');
+    const maximumScoreInput = panel.querySelector('[data-role="maximum-score"]');
     const allowBelowOneCheckbox = panel.querySelector('[data-role="allow-below-one"]');
 
     function formatSpanishScore(value) {
@@ -207,8 +220,8 @@
     function setBusy(busy) {
         state.busy = busy;
         loadButton.disabled = busy || autosavesPending > 0;
-        saveButton.disabled = busy || !state.loaded;
         copyButton.disabled = busy || !state.loaded || state.criteria.length < 2;
+        maximumScoreInput.disabled = busy;
         allowBelowOneCheckbox.disabled = busy;
         panel.querySelector('[data-action="close"]').disabled = busy;
         panel.querySelectorAll(".senecaSpreadsheetGrade").forEach((input) => {
@@ -240,15 +253,65 @@
             : "Introduce una nota entre 1 y 10; para admitir valores inferiores a 1, marca la casilla de la clase.";
     }
 
+    function getMaximumScore() {
+        const text = maximumScoreInput.value.trim().replace(",", ".");
+        if (text === "") {
+            return { valid: true, value: null };
+        }
+        const value = Number(text);
+        const valid = /^\d+(?:\.\d+)?$/.test(text) && Number.isFinite(value) && value > 0;
+        return { valid, value };
+    }
+
+    function validateMaximumScore() {
+        const maximum = getMaximumScore();
+        maximumScoreInput.setCustomValidity(maximum.valid ? "" : "Introduce una puntuación máxima mayor que 0.");
+        maximumScoreInput.setAttribute("aria-invalid", String(!maximum.valid));
+        return maximum;
+    }
+
     function validateGradeInput(input, report = false) {
-        const parsed = parseGrade(input.value);
-        input.setCustomValidity(parsed.valid ? "" : validationMessage());
+        const maximum = getMaximumScore();
+        let parsed;
+        let message = validationMessage();
+        if (input.dataset.rawScore === "true" && maximum.valid && maximum.value !== null) {
+            const text = input.value.trim().replace(",", ".");
+            const score = Number(text);
+            const valid = text === "" || (/^\d+(?:\.\d+)?$/.test(text)
+                && Number.isFinite(score) && score <= maximum.value);
+            const normalized = Math.round((score / maximum.value * 10 + Number.EPSILON) * 100) / 100;
+            parsed = {
+                valid,
+                value: text === "" ? "" : String(Math.max(allowBelowOneCheckbox.checked ? 0 : 1, normalized))
+            };
+            message = `Introduce una puntuación entre 0 y ${formatSpanishScore(maximum.value)}.`;
+        } else if (input.dataset.rawScore === "true" && !maximum.valid) {
+            parsed = { valid: false, value: "" };
+            message = "Corrige primero la puntuación máxima.";
+        } else {
+            parsed = parseGrade(input.value);
+        }
+        input.setCustomValidity(parsed.valid ? "" : message);
         input.classList.toggle("senecaSpreadsheetInvalid", !parsed.valid);
         input.setAttribute("aria-invalid", String(!parsed.valid));
         if (!parsed.valid && report) {
             input.reportValidity();
         }
         return parsed;
+    }
+
+    function updateStudentGrade(student, criterionId, input, row) {
+        const parsed = validateGradeInput(input);
+        student.editedGrades[criterionId] = parsed.valid ? parsed.value : null;
+        const hasInvalidGrade = Array.from(row.querySelectorAll(".senecaSpreadsheetGrade"))
+            .some((gradeInput) => !validateGradeInput(gradeInput).valid);
+        const hasPendingChange = state.criteria.some((entry) =>
+            student.editedGrades[entry.id] !== null
+            && student.editedGrades[entry.id] !== undefined
+            && student.editedGrades[entry.id] !== student.grades[entry.id]
+        );
+        row.querySelector(".senecaSpreadsheetRowStatus").textContent =
+            hasInvalidGrade ? "Nota no válida" : (hasPendingChange ? "Pendiente" : "");
     }
 
     function renderTable() {
@@ -291,19 +354,19 @@
                 gradeInput.dataset.studentIndex = String(index);
                 gradeInput.dataset.criterionId = criterion.id;
                 gradeInput.addEventListener("input", () => {
-                    const parsed = validateGradeInput(gradeInput);
-                    student.editedGrades[criterion.id] = parsed.valid ? parsed.value : null;
-                    const hasInvalidGrade = Array.from(row.querySelectorAll(".senecaSpreadsheetGrade"))
-                        .some((input) => !validateGradeInput(input).valid);
-                    const hasPendingChange = state.criteria.some((entry) =>
-                        student.editedGrades[entry.id] !== null
-                        && student.editedGrades[entry.id] !== undefined
-                        && student.editedGrades[entry.id] !== student.grades[entry.id]
-                    );
-                    row.querySelector(".senecaSpreadsheetRowStatus").textContent =
-                        hasInvalidGrade ? "Nota no válida" : (hasPendingChange ? "Pendiente" : "");
+                    gradeInput.dataset.rawScore = "true";
+                    updateStudentGrade(student, criterion.id, gradeInput, row);
                 });
                 gradeInput.addEventListener("blur", () => {
+                    if (gradeInput.dataset.rawScore === "true") {
+                        const parsed = validateGradeInput(gradeInput);
+                        if (parsed.valid) {
+                            if (getMaximumScore().value !== null) {
+                                gradeInput.value = formatSpanishScore(parsed.value);
+                            }
+                            delete gradeInput.dataset.rawScore;
+                        }
+                    }
                     enqueueAutosave(student, row);
                 });
                 gradeCell.append(gradeInput);
@@ -318,11 +381,14 @@
 
         table.append(header, body);
         tableContainer.replaceChildren(table);
-        saveButton.disabled = state.busy || !state.loaded;
         copyButton.disabled = state.busy || !state.loaded || state.criteria.length < 2;
     }
 
     function copyFirstCriterionToRest() {
+        if (!validateMaximumScore().valid) {
+            status.textContent = "No se copiaron las notas: corrige la puntuación máxima o deja el campo vacío.";
+            return;
+        }
         const firstCriterion = state.criteria[0];
         if (!firstCriterion || state.criteria.length < 2) {
             status.textContent = "Se necesitan al menos dos criterios para copiar notas.";
@@ -359,7 +425,9 @@
 
         copies.forEach(({ input, value }) => {
             input.value = formatSpanishScore(value);
-            input.dispatchEvent(new Event("input", { bubbles: true }));
+            delete input.dataset.rawScore;
+            const student = state.students[Number(input.dataset.studentIndex)];
+            updateStudentGrade(student, input.dataset.criterionId, input, input.closest("tr"));
         });
 
         const copiedRows = new Set(copies.map(({ input }) => input.closest("tr")));
@@ -622,16 +690,6 @@
         return firstInvalid === null;
     }
 
-    function validateAllGrades(report = false) {
-        const gradeInputs = Array.from(panel.querySelectorAll(".senecaSpreadsheetGrade"));
-        const invalidInputs = gradeInputs.filter((input) => !validateGradeInput(input).valid);
-        if (report && invalidInputs.length > 0) {
-            invalidInputs[0].focus();
-            invalidInputs[0].reportValidity();
-        }
-        return invalidInputs.length === 0;
-    }
-
     function markSnapshotSaved(student, snapshot) {
         state.criteria.forEach((criterion) => {
             if (!Object.hasOwn(snapshot, criterion.id)) {
@@ -691,6 +749,11 @@
     }
 
     function enqueueAutosave(student, row) {
+        if (!validateMaximumScore().valid) {
+            setStudentRowStatus(student, "Autoguardado bloqueado: corrige la puntuación máxima.");
+            status.textContent = "No se guardaron los cambios: introduce una puntuación máxima mayor que 0 o deja el campo vacío.";
+            return;
+        }
         if (state.busy || !state.loaded || !validateStudentRow(student, row)) {
             if (state.loaded && !state.busy) {
                 setStudentRowStatus(student, "Autoguardado bloqueado: corrige las notas no válidas.");
@@ -698,6 +761,16 @@
             }
             return;
         }
+
+        maximumScoreInput.addEventListener("input", () => {
+            const maximum = validateMaximumScore();
+            if (!maximum.valid) {
+                status.textContent = "Introduce una puntuación máxima mayor que 0 o deja el campo vacío.";
+            } else if (maximumScoreWasInvalid) {
+                status.textContent = "Puntuación máxima corregida. Para reintentar el autoguardado, entra y sal de una casilla de la fila.";
+            }
+            maximumScoreWasInvalid = !maximum.valid;
+        });
 
         const snapshot = getPendingGrades(student);
         if (Object.keys(snapshot).length === 0) {
@@ -720,7 +793,7 @@
                 status.textContent = `Cambios de ${student.name} guardados automáticamente.`;
             } catch (error) {
                 setStudentRowStatus(student, "Error al autoguardar");
-                status.textContent = `No se pudieron autoguardar los cambios de ${student.name}: ${error.message} Pulsa «Guardar cambios» para reintentarlo.`;
+                status.textContent = `No se pudieron autoguardar los cambios de ${student.name}: ${error.message} Revisa las notas en Séneca y vuelve a entrar y salir de una casilla de esa fila para reintentarlo.`;
                 console.error("[Seneca grade spreadsheet] Autosave failed", error);
             } finally {
                 autosavesPending -= 1;
@@ -728,73 +801,6 @@
                 loadButton.disabled = state.busy || autosavesPending > 0;
             }
         });
-    }
-
-    async function saveChanges() {
-        if (!validateAllGrades(true)) {
-            status.textContent = "No se guardó ningún cambio: corrige primero las notas marcadas en rojo.";
-            return;
-        }
-
-        setBusy(true);
-        try {
-            await autosaveQueue;
-
-            if (!validateAllGrades(true)) {
-                status.textContent = "No se guardó ningún cambio: corrige primero las notas marcadas en rojo.";
-                return;
-            }
-
-            const changedStudents = state.students.filter((student) => state.criteria.some((criterion) =>
-                student.editedGrades[criterion.id] !== null
-                && student.editedGrades[criterion.id] !== undefined
-                && student.editedGrades[criterion.id] !== student.grades[criterion.id]
-            ));
-            if (changedStudents.length === 0) {
-                status.textContent = "No hay cambios para guardar.";
-                return;
-            }
-
-            for (let index = 0; index < changedStudents.length; index += 1) {
-                const student = changedStudents[index];
-                const modal = getModal();
-
-                if (!modal || getCurrentStudentId(modal) !== student.id) {
-                    status.textContent = `Preparando ${index + 1} de ${changedStudents.length}: ${student.name}`;
-                    await loadStudent(student.id);
-                }
-
-                const snapshot = getPendingGrades(student);
-                applyStudentGrades(student, snapshot);
-                setStudentRowStatus(student, "Guardando…");
-                status.textContent = `Guardando ${index + 1} de ${changedStudents.length}: ${student.name}`;
-
-                const nextChangedStudentId = index + 1 < changedStudents.length
-                    ? changedStudents[index + 1].id
-                    : null;
-                const saveTargetId = nextChangedStudentId
-                    || (state.originalStudentId !== student.id
-                        ? state.originalStudentId
-                        : state.students.find((entry) => entry.id !== student.id)?.id)
-                    || student.id;
-                await loadStudent(saveTargetId);
-
-                markSnapshotSaved(student, snapshot);
-            }
-
-            const currentModal = getModal();
-            if (currentModal && getCurrentStudentId(currentModal) !== state.originalStudentId) {
-                status.textContent = "Volviendo al estudiante inicial...";
-                await loadStudent(state.originalStudentId);
-            }
-
-            status.textContent = `Guardadas las notas de ${changedStudents.length} estudiantes.`;
-        } catch (error) {
-            status.textContent = `Guardado detenido: ${error.message} Revisa las notas en Seneca antes de volver a intentarlo.`;
-            throw error;
-        } finally {
-            setBusy(false);
-        }
     }
 
     allowBelowOneCheckbox.addEventListener("change", () => {
@@ -840,13 +846,6 @@
             panel.classList.remove("senecaSpreadsheetVisible");
         } else if (button.dataset.action === "load") {
             loadAllStudents().catch((error) => {
-                if (!status.textContent.includes(error.message)) {
-                    status.textContent = error.message;
-                }
-                console.error("[Seneca grade spreadsheet]", error);
-            });
-        } else if (button.dataset.action === "save") {
-            saveChanges().catch((error) => {
                 if (!status.textContent.includes(error.message)) {
                     status.textContent = error.message;
                 }
